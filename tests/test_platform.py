@@ -23,6 +23,7 @@ os.environ["PLATFORM_NODES"] = (
 )
 os.environ["NODE_CALL_TIMEOUT"] = "1.0"
 os.environ["LOAD_TIMEOUT"] = "4"
+os.environ["UNKNOWN_GRACE_S"] = "2"
 os.environ["POLL_INTERVAL"] = "0.2"
 os.environ["HEALTH_INTERVAL"] = "3600"  # 测试中手动驱动健康监测
 
@@ -56,6 +57,7 @@ async def client():
         os.remove(os.environ["PLATFORM_DB"])
     from app import db as db_mod
     db_mod._conn = None
+    service._unknown_since.clear()  # 用例间隔离宽限时钟
     # ASGI 测试传输下用 0 表示直接抛连接异常；真实 uvicorn 下用长挂起复现超时
     sim_a = simulator.create_app("node-a", "模拟节点A", 8192, 0.3, 0.15,
                                  unreachable_sleep=0)
@@ -74,6 +76,7 @@ async def client():
         async def poll_loop():
             while True:
                 await service.poll_loading()
+                await service.poll_unverified()
                 await service.poll_releasing()
                 await asyncio.sleep(0.2)
 
@@ -104,6 +107,22 @@ async def wait_for(client, dep_id, statuses, timeout=12.0):
 
 def node_free(book, nid):
     return next(n["free_mb"] for n in book if n["node_id"] == nid)
+
+
+def insert_dep(dep_id, model, mem, dep_status, node_id, rep_status, epoch=1):
+    """直接写库构造“崩溃前”现场：副本已预留/已下发，但加载任务随进程退出丢失。"""
+    import app.db as db_mod
+    ts = service.now()
+    with db_mod.tx() as conn:
+        conn.execute(
+            "INSERT INTO deployments(id,model_name,mem_per_replica_mb,replica_count,status,"
+            "reason,epoch,attempts,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (dep_id, model, mem, 1, dep_status, "已预留显存，等待加载", epoch, 1, ts, ts))
+        conn.execute(
+            "INSERT INTO replicas(id,deployment_id,node_id,seq,epoch,status,mem_mb,"
+            "last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (f"{dep_id}-r1-e{epoch}", dep_id, node_id, 1, epoch, rep_status, mem,
+             None, ts, ts))
 
 
 @pytest.mark.asyncio
@@ -353,3 +372,204 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
     r2 = await client.post("/api/deployments", json={
         "model_name": "new-tenant", "mem_per_replica_mb": 7000, "replica_count": 1})
     assert r2.status_code == 201, r2.text
+
+
+@pytest.mark.asyncio
+async def test_08_restart_resumes_pending_and_loading(client):
+    # 启动接续：写库后未下发(PENDING)与已下发回执未落库(LOADING)的副本，
+    # 沿用原副本标识与轮次恢复加载；节点侧同轮重复加载不重启。
+    from app import models
+
+    # 1) 崩溃前现场一：PENDING（已预留未下发，加载任务随进程退出丢失）
+    insert_dep("dep-reboot-p", "reboot-pending", 700,
+               models.DEP_PENDING, "node-a", models.REP_PENDING)
+
+    # 2) 崩溃前现场二：LOADING（已下发但回执未落库），节点侧正在加载
+    await client.post("/api/nodes/node-b/control", json={"load_delay": 2})
+    r = await client.post("http://testnode-b/models/reboot-loading/load",
+                          params={"replica": "dep-reboot-l-r1-e1", "epoch": 1,
+                                  "mem_mb": 800})
+    assert r.status_code == 202
+    insert_dep("dep-reboot-l", "reboot-loading", 800,
+               models.DEP_PENDING, "node-b", models.REP_LOADING)
+
+    # 3) 模拟平台重启后的接续
+    service.resume_after_restart()
+
+    dep_p = await wait_for(client, "dep-reboot-p", {"AVAILABLE"})
+    dep_l = await wait_for(client, "dep-reboot-l", {"AVAILABLE"})
+    # 沿用原副本标识与轮次
+    assert dep_p["replicas"][0]["id"] == "dep-reboot-p-r1-e1"
+    assert dep_p["replicas"][0]["epoch"] == 1
+    assert dep_l["replicas"][0]["id"] == "dep-reboot-l-r1-e1"
+    assert dep_l["replicas"][0]["status"] == "LOADED"
+    # 节点侧同轮重复加载未重启已进行的加载
+    sim_b = client._transport._b.app.state  # type: ignore[attr-defined]
+    rec = sim_b.replicas["dep-reboot-l-r1-e1"]
+    assert rec["attempts"] == 1 and rec["status"] == "loaded"
+    # 显存账本正确
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 700
+    assert node_free(book, "node-b") == 8192 - 800
+
+
+@pytest.mark.asyncio
+async def test_09_duplicate_load_same_epoch_not_restarted(client):
+    # 节点幂等：同轮重复加载不得重启正在进行或已经完成的加载
+    await client.post("/api/nodes/node-a/control", json={"load_delay": 1.5})
+    url = "http://testnode-a/models/dup-model/load"
+
+    r1 = await client.post(url, params={"replica": "rid-dup", "epoch": 3, "mem_mb": 100})
+    assert r1.status_code == 202
+    # 加载进行中重复下发同轮请求：不得重启
+    await asyncio.sleep(0.3)
+    r2 = await client.post(url, params={"replica": "rid-dup", "epoch": 3, "mem_mb": 100})
+    assert r2.status_code == 200 and r2.json()["status"] == "loading"
+    state = (await client.get("http://testnode-a/state")).json()
+    assert state["replicas"]["rid-dup"]["attempts"] == 1
+
+    # 等待完成后再次重复下发：不得重启已完成的加载
+    await asyncio.sleep(1.5)
+    r3 = await client.post(url, params={"replica": "rid-dup", "epoch": 3, "mem_mb": 100})
+    assert r3.status_code == 200 and r3.json()["status"] == "loaded"
+    state = (await client.get("http://testnode-a/state")).json()
+    rec = state["replicas"]["rid-dup"]
+    assert rec["attempts"] == 1 and rec["status"] == "loaded"
+
+    # 撤销后同轮重复加载：拒绝复活，防止迟到请求重新占用显存
+    await client.post("http://testnode-a/models/dup-model/unload",
+                      params={"replica": "rid-dup", "epoch": 3})
+    await asyncio.sleep(0.5)  # 等卸载落地（unload_delay 0.15）
+    r4 = await client.post(url, params={"replica": "rid-dup", "epoch": 3, "mem_mb": 100})
+    assert r4.status_code == 409
+
+    # 不同 epoch 才是新一轮：允许覆盖重新计次
+    r5 = await client.post(url, params={"replica": "rid-dup", "epoch": 4, "mem_mb": 100})
+    assert r5.status_code == 202
+    state = (await client.get("http://testnode-a/state")).json()
+    rec = state["replicas"]["rid-dup"]
+    assert rec["epoch"] == 4 and rec["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_10_inflight_load_unknown_not_released(client):
+    # 旧请求仍可能到达：加载落账延迟期间节点查无副本，不得释放显存
+    # 落账延迟 0.6s：> 轮询间隔 0.2s，< 调用超时 1.0s
+    await client.post("/api/nodes/node-a/control", json={"load_register_delay": 0.6})
+    r = await client.post("/api/deployments", json={
+        "model_name": "inflight", "mem_per_replica_mb": 512, "replica_count": 1})
+    assert r.status_code == 201
+    dep_id = r.json()["id"]
+
+    # 落账延迟窗口内多次观察：副本必须保持加载中，显存必须保持预留
+    for _ in range(2):
+        await asyncio.sleep(0.2)
+        dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+        rep = dep["replicas"][0]
+        assert rep["status"] in {"PENDING", "LOADING"}, rep
+        book = (await client.get("/api/nodes")).json()
+        assert node_free(book, rep["node_id"]) == 8192 - 512
+
+    # 旧请求落账后正常完成，节点侧记录与账本一致（无泄漏）
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    rep = dep["replicas"][0]
+    assert rep["status"] == "LOADED"
+    sim_a = client._transport._a.app.state  # type: ignore[attr-defined]
+    assert sim_a.replicas[rep["id"]]["status"] == "loaded"
+
+
+@pytest.mark.asyncio
+async def test_11_sustained_unknown_eventually_released(client):
+    # 节点持续查无副本超过宽限期：确认未占用后才释放预留
+    from app import models
+    insert_dep("dep-ghost", "ghost", 600,
+               models.DEP_PENDING, "node-a", models.REP_LOADING)
+
+    # 宽限期（2s）内：保持 LOADING 与预留，不得释放
+    await asyncio.sleep(1.0)
+    dep = (await client.get("/api/deployments/dep-ghost")).json()
+    assert dep["replicas"][0]["status"] == "LOADING"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 600
+
+    # 宽限期满仍查无副本：确认节点无残留后释放
+    dep = await wait_for(client, "dep-ghost", {"FAILED"}, timeout=8)
+    assert dep["replicas"][0]["status"] == "LOAD_FAILED"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192
+
+
+@pytest.mark.asyncio
+async def test_12_restart_interleaving_no_revive_no_overcommit(client):
+    # 重启交错：接续与在途加载交错、重复重启，不复活旧轮副本、不让新部署超额
+    # 1) 一个失败重试过的部署：epoch=1 副本为终态 LOAD_FAILED
+    await client.post("/api/nodes/node-a/control", json={"load_fail": True})
+    r = await client.post("/api/deployments", json={
+        "model_name": "flaky", "mem_per_replica_mb": 1000, "replica_count": 1})
+    dep1_id = r.json()["id"]
+    await wait_for(client, dep1_id, {"FAILED"})
+    await client.post("/api/nodes/node-a/control",
+                      json={"load_fail": False, "mode": "normal"})
+    r = await client.post(f"/api/deployments/{dep1_id}/retry")
+    assert r.status_code == 200
+    dep1 = await wait_for(client, dep1_id, {"AVAILABLE"})
+    assert dep1["epoch"] == 2
+
+    # 2) 新部署加载在途时，模拟平台重启接续（并重复执行，验证幂等）
+    await client.post("/api/nodes/node-a/control", json={"load_delay": 1.2})
+    await client.post("/api/nodes/node-b/control", json={"load_delay": 1.2})
+    r = await client.post("/api/deployments", json={
+        "model_name": "mid-flight", "mem_per_replica_mb": 2000, "replica_count": 2})
+    assert r.status_code == 201
+    dep2_id = r.json()["id"]
+    service.resume_after_restart()   # 接续与在途加载交错
+    service.resume_after_restart()   # 重复重启：必须幂等
+    dep2 = await wait_for(client, dep2_id, {"AVAILABLE"})
+    assert dep2["status"] == "AVAILABLE"
+
+    # 3) 旧轮副本未被复活
+    dep1 = (await client.get(f"/api/deployments/{dep1_id}")).json()
+    old = [x for x in dep1["replicas"] if x["epoch"] == 1]
+    assert old and all(x["status"] == "LOAD_FAILED" for x in old)
+
+    # 4) 节点侧每个副本只真正加载过一次（重复下发未重启加载）
+    for host in ("testnode-a", "testnode-b"):
+        state = (await client.get(f"http://{host}/state")).json()
+        for rid, rec in state["replicas"].items():
+            assert rec["attempts"] == 1, (host, rid, rec)
+
+    # 5) 账本不超额：node-a = flaky(1000) + mid-flight(2000)，node-b = 2000
+    book = (await client.get("/api/nodes")).json()
+    for n in book:
+        assert n["used_mb"] <= n["capacity_mb"]
+    assert node_free(book, "node-a") == 8192 - 3000
+    assert node_free(book, "node-b") == 8192 - 2000
+
+    # 6) 重启接续后新部署仍受账本约束：超额必须拒绝
+    r = await client.post("/api/deployments", json={
+        "model_name": "too-big", "mem_per_replica_mb": 6000, "replica_count": 2})
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_13_unverified_auto_confirm_after_recovery(client):
+    # 待核副本：节点失联时保留占用，恢复后由持续确认自动补确认，无需人工对账
+    await client.post("/api/nodes/node-a/control", json={"mode": "unreachable"})
+    r = await client.post("/api/deployments", json={
+        "model_name": "auto-confirm", "mem_per_replica_mb": 512, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"UNVERIFIED"}, timeout=10)
+    rid = dep["replicas"][0]["id"]
+    assert dep["replicas"][0]["status"] == "TIMEOUT"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 512  # 失联期间保留占用
+
+    # 节点恢复，且失联期间加载其实已完成（迟到落地）
+    sim_a = client._transport._a.app.state  # type: ignore[attr-defined]
+    sim_a.replicas[rid] = {"model": "auto-confirm", "mem_mb": 512, "epoch": 1,
+                           "status": "loaded", "attempts": 1}
+    await client.post("/api/nodes/node-a/control", json={"mode": "normal"})
+
+    # 不手动对账：持续确认自动补确认
+    dep = await wait_for(client, dep_id, {"AVAILABLE"}, timeout=10)
+    assert dep["replicas"][0]["status"] == "LOADED"

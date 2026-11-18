@@ -39,6 +39,9 @@ LOAD_TIMEOUT = float(os.environ.get("LOAD_TIMEOUT", "30"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
 # 节点健康探测间隔
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "10.0"))
+# “查无副本”宽限期：节点暂时查无副本时，在途旧请求仍可能到达落账，
+# 只有持续查无副本超过该时长才允许确认释放显存
+UNKNOWN_GRACE_S = float(os.environ.get("UNKNOWN_GRACE_S", "10"))
 
 NODES: list[NodeConfig] = _nodes_from_env()
 NODE_MAP: dict[str, NodeConfig] = {n.node_id: n for n in NODES}

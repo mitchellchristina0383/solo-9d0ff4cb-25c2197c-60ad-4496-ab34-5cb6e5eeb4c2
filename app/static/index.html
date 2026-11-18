@@ -148,6 +148,7 @@ function renderFaults(nodes){
       <button class="danger" onclick="setControl('${n.node_id}',{mode:'unreachable'})">模拟失联</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:true})">下次加载失败</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:false,ack_delay:4})">迟到回执4s</button>
+      <button class="ghost" onclick="setControl('${n.node_id}',{load_register_delay:3})">加载落账延迟3s</button>
       <button class="ghost" onclick="resetNode('${n.node_id}')">重置节点</button>
     </div>`).join('');
 }

@@ -1,7 +1,8 @@
-"""调度核心：并发预留、加载编排、超时待核、恢复对账、失败重试。"""
+"""调度核心：并发预留、加载编排、超时待核、恢复对账、失败重试、启动接续。"""
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -37,6 +38,33 @@ def _spawn(coro) -> None:
             print(f"[background-task] {exc.__class__.__name__}: {exc}")
 
     task.add_done_callback(_watch)
+
+
+# ---------------------------------------------------------------- 查无副本宽限
+# rid -> 首次连续“查无副本”的单调时钟。节点暂时查无副本时，在途旧请求仍可能
+# 到达落账，绝不能仅凭一次查询就释放显存；持续超过宽限期才允许确认释放。
+# 内存态即可：进程重启只会把宽限时钟归零（方向更安全）。
+_unknown_since: dict[str, float] = {}
+
+
+def _unknown_hold(conn, rid: str, dep_id: str, node_id: str, node_name: str) -> bool:
+    """查无副本时的宽限判定。返回 True 表示仍在宽限期：必须保持预留继续确认。"""
+    now_m = time.monotonic()
+    first = _unknown_since.get(rid)
+    if first is None:
+        _unknown_since[rid] = now_m
+        log_event(
+            conn, "UNKNOWN_HOLD",
+            f"{node_name} 暂时查无副本；在途旧请求仍可能到达落账，"
+            f"{config.UNKNOWN_GRACE_S:.0f}s 宽限期内保持预留并继续确认",
+            dep_id, rid, node_id)
+        return True
+    return (now_m - first) < config.UNKNOWN_GRACE_S
+
+
+def _unknown_clear(rid: str) -> None:
+    """节点给出明确答复（非 unknown）或副本已处置完毕时，重置宽限时钟。"""
+    _unknown_since.pop(rid, None)
 
 
 # ---------------------------------------------------------------- 初始化
@@ -89,6 +117,34 @@ def mark_node_online(node_id: str, mode: str = "") -> None:
         )]
         for dep_id in dep_ids:
             _spawn(reconcile(dep_id))
+
+
+# ---------------------------------------------------------------- 启动接续
+def resume_after_restart() -> None:
+    """平台重启后的部署接续。
+
+    加载任务写在库中、由内存后台任务执行；进程退出后任务丢失，副本会永远停在
+    “调度中”。启动时恢复各部署**当前 epoch** 的 PENDING（写库后未下发）与
+    LOADING（已下发但回执未落库）副本，沿用原副本标识与轮次重新下发；
+    节点侧对同轮重复加载幂等，不会重启在途/已完成的加载，旧轮副本绝不复活。
+    TIMEOUT/UNVERIFIED/RELEASING 副本由周期轮询（poll_unverified/poll_releasing）
+    持续确认，无需在此特殊处理。
+    """
+    rows = db.query(
+        "SELECT r.id AS rid FROM replicas r "
+        "JOIN deployments d ON d.id = r.deployment_id "
+        "WHERE r.status IN (?,?) AND r.epoch = d.epoch ORDER BY r.created_at",
+        (models.REP_PENDING, models.REP_LOADING),
+    )
+    if not rows:
+        return
+    with db.tx() as conn:
+        log_event(
+            conn, "PLATFORM_RESUME",
+            f"平台启动接续：恢复 {len(rows)} 个写库后未完成的加载副本"
+            f"（沿用原副本标识与轮次；节点对同轮重复加载幂等）")
+    for row in rows:
+        _spawn(_load_replica(row["rid"], resumed=True))
 
 
 # ---------------------------------------------------------------- 显存账本
@@ -253,17 +309,44 @@ def _evaluate(conn, dep_id: str) -> None:
 
 
 # ---------------------------------------------------------------- 加载编排
-async def _load_replica(rid: str) -> None:
+async def _load_replica(rid: str, resumed: bool = False) -> None:
+    """向节点下发单个副本的加载。resumed=True 用于启动接续：允许重发 LOADING 副本。"""
     rep = db.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
-    if not rep or rep["status"] != models.REP_PENDING:
+    if not rep:
+        return
+    if rep["status"] != models.REP_PENDING and not (
+        resumed and rep["status"] == models.REP_LOADING
+    ):
         return
     dep = db.query_one("SELECT * FROM deployments WHERE id=?", (rep["deployment_id"],))
-    node = config.NODE_MAP[rep["node_id"]]
+    if not dep or rep["epoch"] != dep["epoch"]:
+        return  # 旧轮副本绝不复活
+    node = config.NODE_MAP.get(rep["node_id"])
+    if node is None:
+        with db.tx() as conn:
+            log_event(conn, "LOAD_ABORT",
+                      f"副本所属节点 {rep['node_id']} 不在当前配置中，无法接续下发",
+                      dep["id"], rid, rep["node_id"])
+        return
 
     with db.tx() as conn:
-        _set_replica(conn, rid, models.REP_LOADING)
-        log_event(conn, "LOAD_SEND", f"向 {node.name} 下发加载 {dep['model_name']}（epoch={rep['epoch']}）",
-                  dep["id"], rid, node.node_id)
+        # 事务内复核，避免与创建/重试/接续并发重复下发
+        cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rid,)).fetchone()
+        if cur["status"] == models.REP_PENDING:
+            _set_replica(conn, rid, models.REP_LOADING)
+        elif resumed and cur["status"] == models.REP_LOADING and cur["epoch"] == rep["epoch"]:
+            _set_replica(conn, rid, models.REP_LOADING)  # 刷新等待起点，重新计时
+        else:
+            return
+        if resumed:
+            log_event(conn, "LOAD_RESUME",
+                      f"平台重启接续：重新向 {node.name} 下发加载 {dep['model_name']}"
+                      f"（沿用副本 {rid}，epoch={rep['epoch']}）",
+                      dep["id"], rid, node.node_id)
+        else:
+            log_event(conn, "LOAD_SEND",
+                      f"向 {node.name} 下发加载 {dep['model_name']}（epoch={rep['epoch']}）",
+                      dep["id"], rid, node.node_id)
 
     result = await node_client.load(
         node.base_url, dep["model_name"], rid, rep["epoch"], rep["mem_mb"]
@@ -316,6 +399,8 @@ async def poll_loading() -> None:
                     _evaluate(conn, dep["id"])
                 # 未超时则继续等待，维持 LOADING 与预留
                 continue
+            if remote != "unknown":
+                _unknown_clear(rep["id"])
             if remote == "loaded":
                 _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
                 log_event(conn, "LOAD_CONFIRMED", f"{node.name} 确认加载完成",
@@ -327,10 +412,14 @@ async def poll_loading() -> None:
                 log_event(conn, "LOAD_FAIL", "节点上报加载失败", dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             elif remote == "unknown":
-                # 节点明确不存在该副本，远端不占显存，本侧预留可释放
+                # 节点暂时查无副本：在途旧请求仍可能到达落账，宽限期内不得释放
+                if _unknown_hold(conn, rep["id"], dep["id"], node.node_id, node.name):
+                    continue
+                _unknown_clear(rep["id"])
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
-                             error="对账发现节点上无此副本（加载未生效）", released=True)
-                log_event(conn, "LOAD_MISSING", "节点上无此副本，释放预留",
+                             error=f"持续 {config.UNKNOWN_GRACE_S:.0f}s 查无副本，"
+                                   "确认加载未生效", released=True)
+                log_event(conn, "LOAD_MISSING", "宽限期满节点仍无此副本，释放预留",
                           dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             else:  # loading / unloading：仍在途
@@ -343,6 +432,72 @@ async def poll_loading() -> None:
 
 
 # ---------------------------------------------------------------- 释放/对账
+async def poll_unverified() -> None:
+    """持续确认待核副本（TIMEOUT/UNVERIFIED）。
+
+    节点失联期间保留占用待核；恢复后继续确认：
+    - 节点其实已加载 → 同一 epoch 合法补确认；
+    - 节点上报失败/已卸载 → 确认终态并释放；
+    - 持续查无副本超过宽限期 → 确认节点无残留后释放；
+    - 仍失联/在途 → 保持占用待核，下轮继续。
+    """
+    reps = db.query(
+        "SELECT * FROM replicas WHERE status IN (?,?) ORDER BY updated_at",
+        (models.REP_TIMEOUT, models.REP_UNVERIFIED),
+    )
+    for rep in reps:
+        node = config.NODE_MAP.get(rep["node_id"])
+        if node is None:
+            continue
+        dep = db.query_one("SELECT * FROM deployments WHERE id=?", (rep["deployment_id"],))
+        if not dep or rep["epoch"] != dep["epoch"]:
+            continue  # 旧轮副本不复活、不处置
+        result = await node_client.query_replica(node.base_url, rep["id"], rep["epoch"])
+        with db.tx() as conn:
+            cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rep["id"],)).fetchone()
+            if cur["status"] not in (models.REP_TIMEOUT, models.REP_UNVERIFIED) \
+                    or cur["epoch"] != rep["epoch"]:
+                continue
+            if result.transport_failed:
+                continue  # 节点仍失联：保留占用待核
+            remote = (result.data or {}).get("status") if result.ok else None
+            if remote is None:
+                continue  # 显式故障无法核实，保持待核
+            if remote != "unknown":
+                _unknown_clear(rep["id"])
+            if remote == "loaded":
+                mark_node_online(node.node_id)
+                _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
+                log_event(conn, "LOAD_CONFIRMED",
+                          f"{node.name} 恢复后确认加载完成（待核补确认）",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            elif remote == "failed":
+                _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
+                             error="节点上报加载失败", released=True)
+                log_event(conn, "LOAD_FAIL", "待核期间节点上报加载失败",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            elif remote == "unloaded":
+                _set_replica(conn, rep["id"], models.REP_RELEASED,
+                             error="节点记录已卸载，确认释放", released=True)
+                log_event(conn, "RELEASE_CONFIRMED", "节点确认已卸载，释放显存",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            elif remote == "unknown":
+                if _unknown_hold(conn, rep["id"], dep["id"], node.node_id, node.name):
+                    continue
+                _unknown_clear(rep["id"])
+                _set_replica(conn, rep["id"], models.REP_RELEASED,
+                             error=f"持续 {config.UNKNOWN_GRACE_S:.0f}s 查无副本，"
+                                   "确认节点无残留", released=True)
+                log_event(conn, "RELEASE_CONFIRMED",
+                          "宽限期满仍查无副本，确认释放显存",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            # remote 为 loading/unloading：仍在途，保持待核继续观察
+
+
 async def request_release(rid: str, reason: str) -> None:
     """将待核副本转入释放中，并向节点撤销旧加载（幂等，可重复调用）。"""
     rep = db.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
@@ -388,7 +543,15 @@ async def poll_releasing() -> None:
                              (f"节点失联无法对账：{result.error}，继续保留占用", now(), rep["id"]))
                 continue
             remote = (result.data or {}).get("status")
-            if remote in ("unknown", "unloaded"):
+            if remote != "unknown":
+                _unknown_clear(rep["id"])
+            if remote == "unloaded" or remote == "unknown":
+                # unloaded 是节点的明确终态，可当场确认；unknown 需过宽限期，
+                # 防止在途旧请求尚未落账时误放显存
+                if remote == "unknown" and _unknown_hold(
+                        conn, rep["id"], dep["id"], node.node_id, node.name):
+                    continue
+                _unknown_clear(rep["id"])
                 _set_replica(conn, rep["id"], models.REP_RELEASED,
                              error="节点对账确认已释放", released=True)
                 log_event(conn, "RELEASE_CONFIRMED", "对账确认显存已释放，可重新分配",
@@ -427,6 +590,8 @@ async def reconcile(dep_id: str) -> dict:
                 log_event(conn, "RECONCILE_BLOCKED", note, dep_id, cur["id"], node.node_id)
                 continue
             remote = (result.data or {}).get("status")
+            if remote != "unknown":
+                _unknown_clear(cur["id"])
             st = cur["status"]
             if remote == "loaded":
                 mark_node_online(node.node_id)
@@ -445,6 +610,14 @@ async def reconcile(dep_id: str) -> dict:
                     notes.append(f"{node.name} 上副本正常加载中状态一致")
             elif remote in ("unknown", "unloaded"):
                 mark_node_online(node.node_id)
+                if remote == "unknown" and st != models.REP_LOADED and _unknown_hold(
+                        conn, cur["id"], dep_id, node.node_id, node.name):
+                    # 暂时查无副本：在途旧请求仍可能到达，宽限期内保持预留不处置
+                    note = (f"{node.name} 暂时查无副本 {cur['id']}；在途旧请求仍可能到达落账，"
+                            f"{config.UNKNOWN_GRACE_S:.0f}s 宽限期内保持预留并继续确认")
+                    notes.append(note)
+                    continue
+                _unknown_clear(cur["id"])
                 if st in (models.REP_TIMEOUT, models.REP_UNVERIFIED, models.REP_RELEASING):
                     _set_replica(conn, cur["id"], models.REP_RELEASED,
                                  error=f"对账确认节点无残留（remote={remote}）", released=True)

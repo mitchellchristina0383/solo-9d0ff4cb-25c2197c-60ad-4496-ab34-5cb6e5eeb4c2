@@ -26,6 +26,7 @@ class ControlBody(BaseModel):
     load_delay: float | None = Field(default=None, ge=0, le=60)
     unload_delay: float | None = Field(default=None, ge=0, le=60)
     ack_delay: float | None = Field(default=None, ge=0, le=60)
+    load_register_delay: float | None = Field(default=None, ge=0, le=60)
     load_fail: bool | None = None
 
 
@@ -33,6 +34,7 @@ async def _poll_loop() -> None:
     while True:
         try:
             await service.poll_loading()
+            await service.poll_unverified()
             await service.poll_releasing()
         except Exception as exc:  # 后台循环不能因单次异常退出
             print(f"[poll] {exc.__class__.__name__}: {exc}")
@@ -51,6 +53,8 @@ async def _health_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     service.init_db()
+    # 启动接续：恢复写库后未完成的加载（进程退出导致内存任务丢失）
+    service.resume_after_restart()
     poller = asyncio.create_task(_poll_loop())
     health = asyncio.create_task(_health_loop())
     # 启动即做一次健康探测

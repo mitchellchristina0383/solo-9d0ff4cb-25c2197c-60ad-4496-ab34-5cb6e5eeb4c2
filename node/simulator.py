@@ -5,7 +5,10 @@
 - 可配置加载/卸载延迟、回执延迟（模拟慢节点与迟到回执）
 - 故障模式：normal / slow（高延迟）/ fail（HTTP 503 故障）/ unreachable（超时失联）
 - load_fail：加载请求直接返回 500
+- load_register_delay：加载请求落账前延迟（模拟排队/在途请求，期间查询返回 unknown）
 - 每条副本记录带 epoch，旧 epoch 的迟到回调不会覆盖新状态（防复活）
+- 同轮（同 replica 同 epoch）重复加载幂等：正在进行或已经完成的加载绝不重启，
+  已撤销/已释放的同轮副本拒绝复活（409），防止迟到请求重新占用显存
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ class ControlBody(BaseModel):
     load_delay: float | None = Field(None, ge=0, le=60)
     unload_delay: float | None = Field(None, ge=0, le=60)
     ack_delay: float | None = Field(None, ge=0, le=60)
+    load_register_delay: float | None = Field(None, ge=0, le=60)
     load_fail: bool | None = None
 
 
@@ -37,13 +41,14 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title=f"节点模拟器 {node_id}")
 
-    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed}
+    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed, attempts}
     replicas: Dict[str, Dict[str, Any]] = {}
     control: Dict[str, Any] = {
         "mode": "normal",
         "load_delay": default_load_delay,
         "unload_delay": default_unload_delay,
         "ack_delay": 0.0,
+        "load_register_delay": 0.0,
         "load_fail": False,
     }
     tasks: set[asyncio.Task] = set()
@@ -109,6 +114,19 @@ def create_app(
         if rec and rec["epoch"] == epoch and rec["status"] != "unloaded":
             rec["status"] = "unloaded"
 
+    def same_epoch_reply(rec: Dict[str, Any], rid: str, epoch: int):
+        """同轮重复加载的处置：在途/已完成不重启；已撤销/已释放拒绝复活。"""
+        st = rec["status"]
+        if st in ("loading", "loaded"):
+            # 幂等返回当前状态，不重置记录、不重排计时
+            return {"replica": rid, "epoch": epoch, "status": st, "duplicated": True}
+        if st in ("unloading", "unloaded"):
+            # 同轮副本已在撤销/已释放：拒绝复活，防止迟到请求重新占用显存
+            return JSONResponse(
+                {"detail": f"副本 {rid} epoch={epoch} 处于 {st}，拒绝同轮重复加载"},
+                status_code=409)
+        return None  # failed：调度器明确重发时允许重新加载
+
     @app.post("/models/{model_name}/load")
     async def load(model_name: str, request: Request):
         params = request.query_params
@@ -119,21 +137,44 @@ def create_app(
             return JSONResponse({"detail": "缺少 replica 参数"}, status_code=400)
 
         if control["load_fail"]:
+            prev = replicas.get(rid)
+            attempts = (prev.get("attempts", 0) + 1) \
+                if prev and prev["epoch"] == epoch else 1
             replicas[rid] = {
-                "model": model_name, "mem_mb": mem_mb, "epoch": epoch, "status": "failed",
+                "model": model_name, "mem_mb": mem_mb, "epoch": epoch,
+                "status": "failed", "attempts": attempts,
             }
             await asyncio.sleep(control["ack_delay"])
             return JSONResponse(
                 {"detail": "节点模拟加载失败", "replica": rid}, status_code=500
             )
 
+        # 同轮重复加载：正在进行或已经完成的加载不得重启
         existing = replicas.get(rid)
-        if existing and existing["epoch"] == epoch and existing["status"] == "loaded":
-            return {"replica": rid, "epoch": epoch, "status": "loaded"}
+        if existing and existing["epoch"] == epoch:
+            reply = same_epoch_reply(existing, rid, epoch)
+            if reply is not None:
+                await asyncio.sleep(control["ack_delay"])
+                return reply
+
+        # 模拟排队/在途：落账前延迟（此期间查询返回 unknown，旧请求仍可能到达）
+        if control["load_register_delay"] > 0:
+            await asyncio.sleep(control["load_register_delay"])
+            # 延迟期间可能已有同轮请求先落账：复核，仍不得重启
+            existing = replicas.get(rid)
+            if existing and existing["epoch"] == epoch:
+                reply = same_epoch_reply(existing, rid, epoch)
+                if reply is not None:
+                    await asyncio.sleep(control["ack_delay"])
+                    return reply
 
         # 同一 rid 的新 epoch 直接覆盖，节点已“忘记”旧副本
+        attempts = 1
+        if existing and existing["epoch"] == epoch:
+            attempts = existing.get("attempts", 0) + 1  # failed 后重新加载
         replicas[rid] = {
-            "model": model_name, "mem_mb": mem_mb, "epoch": epoch, "status": "loading",
+            "model": model_name, "mem_mb": mem_mb, "epoch": epoch,
+            "status": "loading", "attempts": attempts,
         }
         schedule(control["load_delay"], finish_load(rid, epoch, control["load_delay"]))
         await asyncio.sleep(control["ack_delay"])
@@ -185,6 +226,7 @@ def create_app(
             load_delay=default_load_delay,
             unload_delay=default_unload_delay,
             ack_delay=0.0,
+            load_register_delay=0.0,
             load_fail=False,
         )
         return {"node_id": node_id, "reset": True}

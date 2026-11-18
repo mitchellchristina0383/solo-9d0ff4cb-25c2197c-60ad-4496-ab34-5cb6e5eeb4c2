@@ -8,6 +8,7 @@ services:
       PLATFORM_NODES: "node-a|模拟节点A|http://node-a:9001|8192,node-b|模拟节点B|http://node-b:9002|8192"
       NODE_CALL_TIMEOUT: "1.5"
       LOAD_TIMEOUT: "30"
+      UNKNOWN_GRACE_S: "10"
       POLL_INTERVAL: "1"
       HEALTH_INTERVAL: "10"
     ports:
